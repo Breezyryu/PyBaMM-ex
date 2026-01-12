@@ -1,353 +1,689 @@
-# PyBaMM DFN 모델 → CasADi 솔버 변환 상세 분석
+# DFN 모델 수식 → 이산화 → CasADi 변환 → Solve 상세 분석
 
-이 문서는 PyBaMM의 DFN(Doyle-Fuller-Newman) 모델이 CasADi 솔버로 해석되는 과정을 상세히 분석합니다.
+이 문서는 PyBaMM DFN(Doyle-Fuller-Newman) 모델의 **핵심 수식**들이 어떻게 **표현식 트리로 정의**되고, **이산화**되어 **행렬 연산**으로 변환되며, 최종적으로 **CasADi 솔버**로 해석되는지를 상세히 분석합니다.
 
-## 전체 흐름 요약
+---
+
+## 전체 프로세스 개요
 
 ```mermaid
 flowchart TD
-    A["`model = pybamm.lithium_ion.DFN()`"] --> B["`Simulation(model)`"]
-    B --> C["`simulation.solve([0, 3600])`"]
-    C --> D["`build()` - 모델 빌드"]
-    D --> E["`Discretisation.process_model()`"]
-    E --> F["`BaseSolver.set_up()`"]
-    F --> G["CasADi 표현식 변환"]
-    G --> H["`CasadiSolver.create_integrator()`"]
-    H --> I["`casadi.integrator()` 호출"]
-    I --> J["적분 수행 및 결과 반환"]
+    subgraph Step1["1. 수식 정의 (Submodels)"]
+        A1["∂c/∂t = -∇·N + S"] --> A2["PyBaMM Symbol 표현식 트리"]
+    end
     
-    style A fill:#e1f5fe
-    style G fill:#fff3e0
-    style I fill:#e8f5e9
+    subgraph Step2["2. 이산화 (Discretisation)"]
+        A2 --> B1["공간 변수 → 메쉬 노드"]
+        B1 --> B2["∇ 연산자 → 희소 행렬"]
+        B2 --> B3["Variable → StateVector"]
+    end
+    
+    subgraph Step3["3. Solver Setup (CasADi 변환)"]
+        B3 --> C1["Symbol.to_casadi()"]
+        C1 --> C2["CasadiConverter._convert()"]
+        C2 --> C3["casadi.Function 생성"]
+    end
+    
+    subgraph Step4["4. Integrator 생성 & Solve"]
+        C3 --> D1["casadi.integrator()"]
+        D1 --> D2["IDAS/CVODES 적분"]
+        D2 --> D3["Solution 반환"]
+    end
+    
+    style Step1 fill:#e3f2fd
+    style Step2 fill:#fff8e1
+    style Step3 fill:#fce4ec
+    style Step4 fill:#e8f5e9
 ```
 
 ---
 
-## 1단계: DFN 모델 정의
+# Part 1: DFN 모델 핵심 수식 정의
 
-**파일**: [dfn.py](file:///c:/Users/Ryu/Python_project/data/PyBaMM-develop/src/pybamm/models/full_battery_models/lithium_ion/dfn.py)
+## 1.1 전해질 농도 확산 (Electrolyte Diffusion)
+
+**파일**: [full_diffusion.py](file:///c:/Users/Ryu/Python_project/data/PyBaMM-develop/src/pybamm/models/submodels/electrolyte_diffusion/full_diffusion.py)
+
+### 물리적 수식 (Stefan-Maxwell)
+
+$$\varepsilon \frac{\partial c_e}{\partial t} = -\nabla \cdot \mathbf{N}_e + \frac{1-t_+}{F} \sum_k a_k j_k$$
+
+여기서 전해질 플럭스 $\mathbf{N}_e$는:
+
+$$\mathbf{N}_e = -\tau D_e^{eff} \nabla c_e + \frac{t_+}{F} \mathbf{i}_e + c_e \mathbf{v}_{box}$$
+
+- **확산** (Diffusion): $-\tau D_e^{eff} \nabla c_e$
+- **이동** (Migration): $t_+ \mathbf{i}_e / F$
+- **대류** (Convection): $c_e \mathbf{v}_{box}$
+
+### PyBaMM 코드에서의 정의
 
 ```python
-model = pybamm.lithium_ion.DFN()
+# full_diffusion.py (lines 72-76)
+N_e_diffusion = -tor * self.param.D_e(c_e, T) * pybamm.grad(c_e)
+N_e_migration = self.param.t_plus(c_e, T) * i_e / self.param.F
+N_e_convection = c_e * v_box
+
+N_e = N_e_diffusion + N_e_migration + N_e_convection
 ```
 
-DFN 클래스는 `BaseModel`을 상속하며, 다음 서브모델들을 설정합니다:
+### RHS 정의 (lines 89-99)
 
-| 서브모델 종류 | 설명 |
-|-------------|------|
-| `set_intercalation_kinetics_submodel()` | Butler-Volmer 반응 속도론 |
-| `set_particle_submodel()` | 입자 내 Fickian 확산 |
-| `set_solid_submodel()` | 고체상 전위/전류 분포 |
-| `set_electrolyte_concentration_submodel()` | 전해질 농도 분포 |
-| `set_electrolyte_potential_submodel()` | 전해질 전위 분포 |
+```python
+def set_rhs(self, variables):
+    eps_c_e = variables["Porosity times concentration [mol.m-3]"]
+    N_e = variables["Electrolyte flux [mol.m-2.s-1]"]
+    source_terms = sum_s_a_j / self.param.F
+    
+    # 핵심 RHS 정의: d(εc_e)/dt = -∇·N_e + source
+    self.rhs = {eps_c_e: -pybamm.div(N_e) + source_terms - c_e * div_Vbox}
+```
 
-각 서브모델은 **수식(equations)**을 PyBaMM의 `Symbol` 표현식 트리로 정의합니다.
+> [!IMPORTANT]
+> `pybamm.grad(c_e)`와 `pybamm.div(N_e)`는 아직 **심볼릭 연산자**입니다. 실제 행렬로 변환되는 것은 **이산화 단계**에서 수행됩니다.
 
 ---
 
-## 2단계: Simulation 객체 생성
+## 1.2 고체상 입자 확산 (Particle Fickian Diffusion)
 
-**파일**: [simulation.py](file:///c:/Users/Ryu/Python_project/data/PyBaMM-develop/src/pybamm/simulation.py)
+**파일**: [fickian_diffusion.py](file:///c:/Users/Ryu/Python_project/data/PyBaMM-develop/src/pybamm/models/submodels/particle/fickian_diffusion.py)
+
+### 물리적 수식
+
+구형 좌표계에서의 Fick 법칙:
+
+$$\frac{\partial c_s}{\partial t} = \frac{1}{r^2} \frac{\partial}{\partial r} \left( r^2 D_s \frac{\partial c_s}{\partial r} \right)$$
+
+표면 경계 조건 (Butler-Volmer 반응에서 결정):
+$$-D_s \frac{\partial c_s}{\partial r} \bigg|_{r=R} = \frac{j}{F}$$
+
+### PyBaMM 코드에서의 정의
 
 ```python
-simulation = pybamm.Simulation(model)
+# fickian_diffusion.py (lines 199-213)
+def get_coupled_variables(self, variables):
+    D_eff = self._get_effective_diffusivity(c_s, T, current)
+    N_s = -D_eff * pybamm.grad(c_s)  # 입자 내부 플럭스
+    
+    variables.update({
+        # 구형 좌표계: (1/R²) * div(N_s)
+        f"{Domain} particle rhs [mol.m-3.s-1]": -(1 / R_broad_nondim**2) * pybamm.div(N_s),
+        # 표면 경계 조건
+        f"{Domain} particle bc [mol.m-4]": -j * R_nondim / self.param.F / pybamm.surf(D_eff),
+    })
 ```
 
-`Simulation.__init__()` (line 70-152)에서:
-- 기본 솔버로 `CasadiSolver`가 설정됨 (`model.default_solver`)
-- 기본 지오메트리, 메쉬 타입, 공간 이산화 방법 등이 설정됨
+### RHS 정의 (lines 240-264)
+
+```python
+def set_rhs(self, variables):
+    c_s = variables[f"{Domain} particle concentration [mol.m-3]"]
+    # RHS = -(1/R²) * ∇·(D * ∇c_s)
+    self.rhs = {c_s: variables[f"{Domain} particle rhs [mol.m-3.s-1]"]}
+```
 
 ---
 
-## 3단계: solve() 호출 → build() 과정
+## 1.3 Butler-Volmer 반응 속도론
 
-**파일**: [simulation.py](file:///c:/Users/Ryu/Python_project/data/PyBaMM-develop/src/pybamm/simulation.py) (line 434-612)
+**파일**: [butler_volmer.py](file:///c:/Users/Ryu/Python_project/data/PyBaMM-develop/src/pybamm/models/submodels/interface/kinetics/butler_volmer.py)
+
+### 물리적 수식
+
+**대칭 Butler-Volmer**:
+$$j = 2 j_0 \sinh\left( \frac{n_e F \eta_r}{2RT} \right)$$
+
+**비대칭 Butler-Volmer**:
+$$j = j_0 \left[ \exp\left(\frac{\alpha n_e F \eta_r}{RT}\right) - \exp\left(-\frac{(1-\alpha) n_e F \eta_r}{RT}\right) \right]$$
+
+여기서:
+- $j_0$: 교환 전류 밀도
+- $\eta_r = \phi_s - \phi_e - U_{OCP}$: 반응 과전위
+- $n_e$: 전자 수
+- $\alpha$: 전하 이동 계수
+
+### PyBaMM 코드에서의 정의
 
 ```python
-simulation.solve([0, 3600])
-```
+# butler_volmer.py
+class SymmetricButlerVolmer(BaseKinetics):
+    def _get_kinetics(self, j0, ne, eta_r, T, u):
+        Feta_RT = self.param.F * eta_r / (self.param.R * T)
+        # j = 2 * j0 * sinh(ne * F * η / 2RT)
+        return 2 * u * j0 * pybamm.sinh(ne * 0.5 * Feta_RT)
 
-### 3.1 build() 과정
-
-`build()` (line 348-385):
-
-```python
-def build(self, initial_soc=None, direction=None, inputs=None):
-    self._set_parameters()  # 파라미터 값 적용
-    self._mesh = pybamm.Mesh(...)  # 메쉬 생성
-    self._disc = pybamm.Discretisation(...)  # 이산화 객체 생성
-    self._built_model = self._disc.process_model(...)  # 모델 이산화
+class AsymmetricButlerVolmer(BaseKinetics):
+    def _get_kinetics(self, j0, ne, eta_r, T, u):
+        alpha = self.phase_param.alpha_bv
+        Feta_RT = self.param.F * eta_r / (self.param.R * T)
+        arg_ox = ne * alpha * Feta_RT
+        arg_red = -ne * (1 - alpha) * Feta_RT
+        # j = j0 * [exp(α*...) - exp(-(1-α)*...)]
+        return u * j0 * (pybamm.exp(arg_ox) - pybamm.exp(arg_red))
 ```
 
 ---
 
-## 4단계: 이산화 (Discretisation)
+## 1.4 수식 → 표현식 트리 구조
+
+PyBaMM에서 모든 수식은 **표현식 트리(Expression Tree)**로 표현됩니다.
+
+### 예시: 전해질 확산 플럭스
+
+```
+N_e = -tor * D_e(c_e, T) * grad(c_e)
+```
+
+이 수식은 다음과 같은 트리 구조를 가집니다:
+
+```
+         Multiplication (*)
+            /          \
+       Negate (-)    Gradient (grad)
+          |              |
+    Multiplication    c_e (Variable)
+       /      \
+    tor    Function(D_e)
+             /    \
+           c_e     T
+```
+
+---
+
+# Part 2: 이산화 (Discretisation)
+
+## 2.1 이산화 과정 개요
 
 **파일**: [discretisation.py](file:///c:/Users/Ryu/Python_project/data/PyBaMM-develop/src/pybamm/discretisations/discretisation.py)
 
-`Discretisation.process_model()` (line 117-299)에서:
-
-1. **변수 슬라이스 설정**: 각 변수가 상태 벡터 `y`의 어느 부분에 해당하는지 매핑
-2. **경계 조건 처리**: 모든 경계 조건을 이산화
-3. **RHS/Algebraic 처리**: 미분 방정식과 대수 방정식을 이산화
-4. **초기 조건 처리**: 초기 상태 벡터 계산
-
-> [!IMPORTANT]
-> 이산화 후, 모든 수식은 **공간 연산자가 행렬로 대체**되고, **변수가 StateVector로 대체**됩니다.
-
-### 이산화 전 (연속적 수식)
-```
-∂c/∂t = D * ∇²c  (Fick의 확산 법칙)
+```mermaid
+flowchart LR
+    A["Variable (c_e)"] --> B["StateVector (y[0:n])"]
+    C["pybamm.grad(c_e)"] --> D["gradient_matrix @ y"]
+    E["pybamm.div(N)"] --> F["divergence_matrix @ N"]
 ```
 
-### 이산화 후 (이산 형태)
-```
-dc/dt = D * M * c  (M은 2차 미분 행렬)
-```
-
-여기서 `c`는 이제 `StateVector(slice(0, n_points))`로 표현됩니다.
-
----
-
-## 5단계: BaseSolver.set_up() - CasADi 변환의 핵심
-
-**파일**: [base_solver.py](file:///c:/Users/Ryu/Python_project/data/PyBaMM-develop/src/pybamm/solvers/base_solver.py) (line 151-318)
-
-이 단계가 **CasADi 변환의 핵심**입니다.
-
-### 5.1 CasADi 심볼 변수 생성
-
-`_get_vars_for_processing()` (line 424-463):
+### Discretisation.process_model() 핵심 단계
 
 ```python
-# CasADi 심볼릭 변수 생성
-t_casadi = casadi.MX.sym("t")                    # 시간 변수
-y_diff = casadi.MX.sym("y_diff", model.len_rhs)  # 미분 상태 변수
-y_alg = casadi.MX.sym("y_alg", model.len_alg)    # 대수 상태 변수
-y_casadi = casadi.vertcat(y_diff, y_alg)         # 전체 상태 벡터
-p_casadi_stacked = casadi.vertcat(...)           # 입력 파라미터
-```
-
-### 5.2 process() 함수로 PyBaMM → CasADi 변환
-
-`set_up()` 내에서 `process()` 함수가 호출됩니다:
-
-```python
-# RHS 처리 (미분 방정식 우변)
-rhs, jac_rhs, jacp_rhs, jac_rhs_action = process(
-    model.concatenated_rhs, "RHS", vars_for_processing
-)
-
-# Algebraic 처리 (대수 방정식)
-algebraic, jac_algebraic, jacp_algebraic, jac_algebraic_action = process(
-    model.concatenated_algebraic, "algebraic", vars_for_processing
-)
-```
-
-### 5.3 CasADi 함수 생성
-
-line 255-277에서 CasADi 솔버용 함수가 생성됩니다:
-
-```python
-# Mass matrix 역행렬 적용하여 explicit RHS 생성
-mass_matrix_inv = casadi.MX(model.mass_matrix_inv.entries)
-explicit_rhs = mass_matrix_inv @ rhs(t_casadi, y_casadi, p_casadi_stacked)
-
-# CasADi 함수로 래핑
-model.casadi_rhs = casadi.Function(
-    "rhs", [t_casadi, y_casadi, p_casadi_stacked], [explicit_rhs]
-)
-model.casadi_algebraic = algebraic  # 대수 방정식도 CasADi 함수
+# discretisation.py (lines 117-299)
+def process_model(self, model, inplace=True, ...):
+    # 1. 변수 슬라이스 설정
+    self.set_variable_slices(model.rhs.keys())
+    
+    # 2. 경계 조건 처리
+    self.bcs = self.process_boundary_conditions(model)
+    
+    # 3. RHS와 대수 방정식 이산화
+    rhs, algebraic = self.process_rhs_and_algebraic(model)
+    
+    # 4. 초기 조건 이산화
+    initial_conditions = self.process_initial_conditions(model)
 ```
 
 ---
 
-## 6단계: CasadiConverter - 표현식 트리 변환
+## 2.2 변수 → StateVector 변환
+
+각 변수는 전체 상태 벡터 `y`의 특정 슬라이스에 매핑됩니다.
+
+### 예시: DFN 모델의 변수 슬라이스
+
+| 변수 | 도메인 | 상태 벡터 슬라이스 |
+|------|--------|------------------|
+| 음극 입자 농도 $c_{s,n}$ | negative particle | `y[0:200]` |
+| 전해질 농도 $\varepsilon c_e$ | whole cell | `y[200:340]` |
+| 양극 입자 농도 $c_{s,p}$ | positive particle | `y[340:540]` |
+| 전해질 전위 $\phi_e$ | whole cell | `y[540:680]` (대수변수) |
+
+### 코드에서의 매핑
+
+```python
+# discretisation.py (lines 344-450)
+def set_variable_slices(self, variables):
+    offset = 0
+    for var in variables:
+        size = self._get_variable_size(var)
+        self.y_slices[var] = [slice(offset, offset + size)]
+        offset += size
+```
+
+이산화 후, `c_e` 변수는 다음과 같이 변환됩니다:
+
+```python
+# 이산화 전
+c_e = pybamm.Variable("Electrolyte concentration", domain="electrolyte")
+
+# 이산화 후
+c_e_discretised = pybamm.StateVector(slice(200, 340))
+```
+
+---
+
+## 2.3 공간 연산자 → 행렬 변환 (FiniteVolume)
+
+**파일**: [finite_volume.py](file:///c:/Users/Ryu/Python_project/data/PyBaMM-develop/src/pybamm/spatial_methods/finite_volume.py)
+
+### Gradient Matrix (∇ 연산자)
+
+**수학적 정의**:
+$$\nabla c \approx \frac{c_{i+1} - c_i}{\Delta x_{i+1/2}}$$
+
+**행렬 형태**:
+```
+        [-1   1   0   0   0 ]         [1/Δx₁    0      0      0   ]
+G = 1/Δx * [ 0  -1   1   0   0 ]  =>   [  0    1/Δx₂    0      0   ] @ 
+        [ 0   0  -1   1   0 ]         [  0      0    1/Δx₃    0   ]
+        [ 0   0   0  -1   1 ]         [  0      0      0    1/Δx₄ ]
+```
+
+**PyBaMM 구현** (lines 196-236):
+
+```python
+def gradient_matrix(self, domain, domains):
+    submesh = self.mesh[domain]
+    e = 1 / submesh.d_nodes  # 1/Δx
+    
+    n = submesh.npts
+    # [-1, 1] 대각행렬 생성
+    sub_matrix_minus = pybamm.Matrix(diags([-1], [0], shape=(n - 1, n)))
+    sub_matrix_plus = pybamm.Matrix(diags([1], [1], shape=(n - 1, n)))
+    sub_matrix = (sub_matrix_minus + sub_matrix_plus) * e
+    
+    return pybamm.kronecker_product(eye(repeats), sub_matrix)
+```
+
+### Divergence Matrix (∇· 연산자)
+
+**수학적 정의**:
+$$\nabla \cdot \mathbf{N} \approx \frac{N_{i+1/2} - N_{i-1/2}}{\Delta x_i}$$
+
+**구형 좌표계** (입자 내부):
+$$\nabla \cdot \mathbf{N} = \frac{1}{r^2} \frac{d(r^2 N)}{dr} \approx \frac{r_{i+1/2}^2 N_{i+1/2} - r_{i-1/2}^2 N_{i-1/2}}{(r_{i+1/2}^3 - r_{i-1/2}^3)/3}$$
+
+**PyBaMM 구현** (lines 238-318):
+
+```python
+def divergence_matrix(self, domains):
+    submesh = self.mesh[domains["primary"]]
+    
+    # 구형 좌표계 처리
+    if submesh.coord_sys == "spherical polar":
+        r_edges_left = submesh.edges[:-1]
+        r_edges_right = submesh.edges[1:]
+        d_edges = (r_edges_right**3 - r_edges_left**3) / 3
+    else:
+        d_edges = submesh.d_edges
+    
+    e = 1 / d_edges
+    n = submesh.npts + 1
+    # [-1, 1] 대각행렬 생성
+    sub_matrix_minus = pybamm.Matrix(diags([-1], [0], shape=(n - 1, n)))
+    sub_matrix_plus = pybamm.Matrix(diags([1], [1], shape=(n - 1, n)))
+    sub_matrix = (sub_matrix_minus + sub_matrix_plus) * e
+    
+    return pybamm.kronecker_product(eye(repeats), sub_matrix)
+```
+
+---
+
+## 2.4 이산화 결과 예시
+
+### 전해질 확산 수식의 변환
+
+**이산화 전** (연속 수식):
+```python
+rhs = {eps_c_e: -pybamm.div(N_e) + source_terms}
+```
+
+**이산화 후** (행렬 연산):
+```python
+rhs = {
+    StateVector(slice(200, 340)):  # eps_c_e
+        DivergenceMatrix @ N_e_discretised + source_terms_discretised
+}
+```
+
+### 표현식 트리 변환
+
+```
+=== 이산화 전 ===
+           Addition (+)
+              /     \
+        Negate     source
+           |
+       Divergence
+           |
+         N_e
+           
+=== 이산화 후 ===
+              Addition (+)
+                /     \
+           Negate    source_vec
+              |
+       MatrixMultiplication (@)
+           /        \
+    DivMatrix      N_e_vec
+    (sparse)     (StateVector)
+```
+
+---
+
+# Part 3: CasADi 변환
+
+## 3.1 변환 진입점
+
+**파일**: [base_solver.py](file:///c:/Users/Ryu/Python_project/data/PyBaMM-develop/src/pybamm/solvers/base_solver.py)
+
+`BaseSolver.set_up()` (lines 151-318)에서 `process()` 함수를 호출하여 이산화된 표현식을 CasADi로 변환합니다.
+
+### process() 함수 (lines 1674-1842)
+
+```python
+def process(symbol, name, vars_for_processing, ...):
+    model = vars_for_processing["model"]
+    
+    if model.convert_to_format == "casadi":
+        t_casadi = vars_for_processing["t_casadi"]
+        y_casadi = vars_for_processing["y_casadi"]
+        p_casadi = vars_for_processing["p_casadi"]
+        
+        # 핵심: Symbol → CasADi 표현식 변환
+        casadi_expression = symbol.to_casadi(t_casadi, y_casadi, inputs=p_casadi)
+        
+        # CasADi Function으로 래핑
+        func = casadi.Function(
+            name, 
+            [t_casadi, y_casadi, p_casadi_stacked], 
+            [casadi_expression]
+        )
+```
+
+---
+
+## 3.2 Symbol.to_casadi() 메서드
+
+**파일**: [symbol.py](file:///c:/Users/Ryu/Python_project/data/PyBaMM-develop/src/pybamm/expression_tree/symbol.py) (lines 977-989)
+
+```python
+def to_casadi(self, t=None, y=None, y_dot=None, inputs=None, casadi_symbols=None):
+    """Convert the expression tree to a CasADi expression tree."""
+    return pybamm.CasadiConverter(casadi_symbols).convert(self, t, y, y_dot, inputs)
+```
+
+---
+
+## 3.3 CasadiConverter 상세 분석
 
 **파일**: [convert_to_casadi.py](file:///c:/Users/Ryu/Python_project/data/PyBaMM-develop/src/pybamm/expression_tree/operations/convert_to_casadi.py)
 
-`CasadiConverter.convert()` (line 19-57)와 `_convert()` (line 59-303)가 PyBaMM 표현식 트리를 재귀적으로 탐색하며 CasADi 표현식으로 변환합니다.
+### 변환 알고리즘
 
-### 변환 규칙
-
-| PyBaMM 타입 | CasADi 변환 |
-|-------------|------------|
-| `Scalar`, `Array` | `casadi.MX(value)` |
-| `StateVector` | `y[slice]` (상태 벡터 슬라이스) |
-| `BinaryOperator` (+, -, *, /) | CasADi 연산자 |
-| `UnaryOperator` (abs, exp, ...) | `casadi.fabs()`, `casadi.exp()` 등 |
-| `Function` (sin, cos, exp, ...) | `casadi.sin()`, `casadi.cos()` 등 |
-| `Interpolant` | `casadi.interpolant()` 또는 bspline |
-
-### 예시: StateVector 변환
+`CasadiConverter._convert()` (lines 59-303)는 **재귀적으로** 표현식 트리를 탐색합니다:
 
 ```python
-elif isinstance(symbol, pybamm.StateVector):
-    if y is None:
-        raise ValueError("Must provide a 'y' for converting state vectors")
-    return casadi.vertcat(*[y[y_slice] for y_slice in symbol.y_slices])
+def _convert(self, symbol, t, y, y_dot, inputs):
+    # 1. Scalar, Array, Time → casadi.MX(value)
+    if isinstance(symbol, pybamm.Scalar | pybamm.Array | pybamm.Time):
+        return casadi.MX(symbol.evaluate(t, y, y_dot, inputs))
+    
+    # 2. StateVector → y[slice] (CasADi 슬라이싱)
+    elif isinstance(symbol, pybamm.StateVector):
+        return casadi.vertcat(*[y[y_slice] for y_slice in symbol.y_slices])
+    
+    # 3. Binary/Unary Operators → 자식 변환 후 연산
+    elif isinstance(symbol, pybamm.BinaryOperator):
+        converted_left = self.convert(symbol.left, t, y, y_dot, inputs)
+        converted_right = self.convert(symbol.right, t, y, y_dot, inputs)
+        return symbol._binary_evaluate(converted_left, converted_right)
+    
+    # 4. 수학 함수 → CasADi 함수
+    elif isinstance(symbol, pybamm.Function):
+        if symbol.function == np.exp:
+            return casadi.exp(*converted_children)
+        elif symbol.function == np.sinh:
+            return casadi.sinh(*converted_children)
+        # ... 기타 함수들
 ```
 
-### 예시: BinaryOperator 변환
+### 변환 규칙 요약
 
-```python
-elif isinstance(symbol, pybamm.BinaryOperator):
-    left, right = symbol.children
-    converted_left = self.convert(left, t, y, y_dot, inputs)
-    converted_right = self.convert(right, t, y, y_dot, inputs)
-    return symbol._binary_evaluate(converted_left, converted_right)
-```
+| PyBaMM 타입 | CasADi 변환 | 예시 |
+|-------------|------------|------|
+| `Scalar(2.5)` | `casadi.MX(2.5)` | 상수 |
+| `StateVector(slice(0,10))` | `y[0:10]` | 상태 변수 |
+| `Addition(a, b)` | `a_casadi + b_casadi` | 덧셈 |
+| `MatrixMultiplication(M, v)` | `M_mx @ v_casadi` | 행렬곱 |
+| `exp(x)` | `casadi.exp(x_casadi)` | 지수함수 |
+| `sinh(x)` | `casadi.sinh(x_casadi)` | 쌍곡사인 |
+| `Interpolant` | `casadi.interpolant(...)` | 보간 |
 
 ---
 
-## 7단계: CasadiSolver.create_integrator()
+## 3.4 변환 예시: Butler-Volmer
 
-**파일**: [casadi_solver.py](file:///c:/Users/Ryu/Python_project/data/PyBaMM-develop/src/pybamm/solvers/casadi_solver.py) (line 496-598)
-
-이 함수가 실제로 `casadi.integrator()`를 호출합니다.
-
-### 7.1 Problem 정의
+### PyBaMM 표현식
 
 ```python
-# CasADi 심볼릭 변수 설정
-t = casadi.MX.sym("t")
-p = casadi.MX.sym("p", inputs.shape[0])
-y_diff = casadi.MX.sym("y_diff", rhs(0, y0, p).shape[0])
-y_alg = casadi.MX.sym("y_alg", algebraic(0, y0, p).shape[0])
-y_full = casadi.vertcat(y_diff, y_alg)
+j = 2 * j0 * pybamm.sinh(ne * 0.5 * F * eta_r / (R * T))
 ```
 
-### 7.2 DAE 문제 정의
+### 표현식 트리
 
-```python
-problem = {
-    "t": t,                    # 시간 변수
-    "x": y_diff,              # 미분 상태 변수
-    "ode": rhs(t_scaled, y_full, p),  # 미분 방정식 (dy/dt = f(t,y))
-    "p": p_with_tlims,        # 파라미터
-}
-
-# DAE인 경우 대수 방정식 추가
-if algebraic(0, y0, p).is_not_empty():
-    method = "idas"  # DAE 솔버
-    problem.update({
-        "z": y_alg,           # 대수 상태 변수
-        "alg": algebraic(...),  # 대수 방정식 (0 = g(t,y,z))
-    })
-else:
-    method = "cvodes"  # ODE 솔버
+```
+        Multiplication
+           /        \
+    Scalar(2)    Multiplication
+                    /       \
+                  j0       sinh
+                             |
+                       Multiplication
+                          /      \
+                    Scalar(0.5)   Division
+                                   /    \
+                           Multiplication  Multiplication
+                              /    \          /    \
+                            ne    Feta_r     R      T
 ```
 
-### 7.3 Integrator 생성
+### CasADi 변환 결과
 
 ```python
-options = {
-    "reltol": self.rtol,  # 상대 허용오차 (기본 1e-6)
-    "abstol": self.atol,  # 절대 허용오차 (기본 1e-6)
-}
-
-# CasADi integrator 생성
-integrator = casadi.integrator("F", method, problem, *time_args, options)
-```
-
-> [!NOTE]
-> - **ODE 모델**: CVODES (SUNDIALS의 BDF/Adams 솔버) 사용
-> - **DAE 모델**: IDAS (SUNDIALS의 BDF DAE 솔버) 사용
-
----
-
-## 8단계: 적분 실행
-
-**파일**: [casadi_solver.py](file:///c:/Users/Ryu/Python_project/data/PyBaMM-develop/src/pybamm/solvers/casadi_solver.py) (line 600-726)
-
-`_run_integrator()` 에서 실제 적분이 수행됩니다:
-
-```python
-casadi_sol = integrator(
-    x0=y0_diff,           # 초기 미분 변수
-    z0=y0_alg,            # 초기 대수 변수
-    p=inputs_with_tmin,   # 파라미터
+# j0, eta_r, T는 casadi.MX 심볼
+j_casadi = 2 * j0_casadi * casadi.sinh(
+    ne * 0.5 * F * eta_r_casadi / (R * T_casadi)
 )
 ```
 
-CasADi의 integrator가 반환하는 결과:
-- `casadi_sol["xf"]`: 각 시점에서의 미분 상태 벡터
-- `casadi_sol["zf"]`: 각 시점에서의 대수 상태 벡터
+---
+
+# Part 4: Integrator 생성 및 Solve
+
+## 4.1 CasadiSolver.create_integrator()
+
+**파일**: [casadi_solver.py](file:///c:/Users/Ryu/Python_project/data/PyBaMM-develop/src/pybamm/solvers/casadi_solver.py) (lines 496-598)
+
+### DAE 문제 정의
+
+```python
+def create_integrator(self, model, inputs, t_eval=None, ...):
+    # CasADi 심볼 변수 정의
+    t = casadi.MX.sym("t")
+    p = casadi.MX.sym("p", inputs.shape[0])
+    y_diff = casadi.MX.sym("y_diff", rhs_size)  # 미분 변수
+    y_alg = casadi.MX.sym("y_alg", alg_size)     # 대수 변수
+    y_full = casadi.vertcat(y_diff, y_alg)
+    
+    # 모델의 CasADi 함수 가져오기
+    rhs = model.casadi_rhs        # dy/dt = f(t, y)
+    algebraic = model.casadi_algebraic  # 0 = g(t, y, z)
+    
+    # DAE 문제 정의
+    problem = {
+        "t": t,
+        "x": y_diff,
+        "ode": rhs(t_scaled, y_full, p),
+        "p": p_with_tlims,
+    }
+    
+    # 대수 방정식이 있으면 추가
+    if not algebraic.is_empty():
+        method = "idas"  # DAE 솔버 (SUNDIALS IDAS)
+        problem.update({
+            "z": y_alg,
+            "alg": algebraic(t_scaled, y_full, p),
+        })
+    else:
+        method = "cvodes"  # ODE 솔버 (SUNDIALS CVODES)
+    
+    # Integrator 생성
+    options = {"reltol": self.rtol, "abstol": self.atol}
+    integrator = casadi.integrator("F", method, problem, options)
+```
 
 ---
 
-## 핵심 수식 흐름 예시
+## 4.2 DFN 모델의 DAE 구조
 
-### DFN 모델의 대표 수식: 전해질 확산
+DFN 모델은 **DAE (Differential-Algebraic Equations)** 시스템입니다:
 
-**연속 형태 (물리 수식)**:
-$$\varepsilon \frac{\partial c_e}{\partial t} = \nabla \cdot (D_e^{eff} \nabla c_e) + \frac{1-t_+}{F} j$$
-
-**이산화 후 (PyBaMM 표현식)**:
-```python
-dcdt = (D_eff @ grad_matrix @ c_e) + source_term
-# grad_matrix는 유한차분/유한체적 행렬
+```
+dy/dt = f(t, y, z)   (미분 방정식)
+  0   = g(t, y, z)   (대수 방정식)
 ```
 
-**CasADi 변환 후**:
-```python
-# t, y, p는 casadi.MX 심볼
-dcdt_casadi = D_eff_mx @ grad_matrix_mx @ y[c_e_slice] + source_mx
-```
+| 미분 변수 (y) | 대수 변수 (z) |
+|--------------|--------------|
+| 음극 입자 농도 $c_{s,n}$ | 전해질 전위 $\phi_e$ |
+| 전해질 농도 $\varepsilon c_e$ | 고체상 전위 $\phi_s$ |
+| 양극 입자 농도 $c_{s,p}$ | |
+| 온도 $T$ (열 모델 시) | |
 
-**최종 integrator 호출**:
+---
+
+## 4.3 Integrator 실행
+
+**파일**: [casadi_solver.py](file:///c:/Users/Ryu/Python_project/data/PyBaMM-develop/src/pybamm/solvers/casadi_solver.py) (lines 600-726)
+
 ```python
-# problem["ode"]에 dcdt_casadi가 포함됨
-casadi.integrator("F", "idas", problem, ...)
+def _run_integrator(self, model, y0, inputs_dict, inputs, t_eval, ...):
+    # 초기 조건 분리
+    y0_diff = y0[:len_rhs]       # 미분 변수 초기값
+    y0_alg = y0[len_rhs:]        # 대수 변수 초기값
+    
+    # Integrator 호출
+    casadi_sol = integrator(
+        x0=y0_diff,              # 미분 변수 초기값
+        z0=y0_alg,               # 대수 변수 초기값
+        p=inputs_with_tmin,      # 파라미터
+    )
+    
+    # 결과 추출
+    x_sol = casadi.horzcat(y0_diff, casadi_sol["xf"])  # 미분 변수 시간 이력
+    z_sol = casadi.horzcat(y0_alg, casadi_sol["zf"])   # 대수 변수 시간 이력
+    y_sol = casadi.vertcat(x_sol, z_sol)
+    
+    return pybamm.Solution(t_eval, y_sol, model, inputs_dict)
 ```
 
 ---
 
-## 디버깅 팁
+## 4.4 SUNDIALS 솔버 알고리즘
 
-### 1. 이산화된 모델의 상태 확인
+CasADi는 내부적으로 **SUNDIALS** 라이브러리를 사용합니다:
+
+| 솔버 | 용도 | 알고리즘 |
+|------|------|---------|
+| **CVODES** | ODE | BDF (Backward Differentiation Formula) 또는 Adams |
+| **IDAS** | DAE | BDF |
+
+### BDF 알고리즘 개요
+
+$$y_{n+1} = \sum_{i=0}^{k} \alpha_i y_{n-i} + h \beta f(t_{n+1}, y_{n+1})$$
+
+- **암시적 방법**: 비선형 시스템을 Newton 반복으로 해결
+- **적응형 시간 스텝**: 오차 추정 기반 자동 스텝 조정
+- **오차 제어**: `rtol=1e-6`, `atol=1e-6` (기본값)
+
+---
+
+# Part 5: 전체 데이터 흐름 요약
+
+## 5.1 전해질 확산 수식의 전체 변환
+
+```mermaid
+flowchart TB
+    subgraph A["1. 물리 수식"]
+        A1["∂(εc_e)/∂t = -∇·N_e + S"]
+    end
+    
+    subgraph B["2. PyBaMM 표현식"]
+        B1["rhs = {eps_c_e: -pybamm.div(N_e) + source}"]
+        B2["where N_e = -tor*D_e*pybamm.grad(c_e) + ..."]
+    end
+    
+    subgraph C["3. 이산화"]
+        C1["StateVector(slice(200,340))"]
+        C2["DivMatrix @ (GradMatrix @ y[200:340])"]
+    end
+    
+    subgraph D["4. CasADi 변환"]
+        D1["y_casadi = casadi.MX.sym('y', 680)"]
+        D2["div_mx @ (grad_mx @ y_casadi[200:340])"]
+    end
+    
+    subgraph E["5. Integrator"]
+        E1["problem = {'ode': rhs_casadi, ...}"]
+        E2["casadi.integrator('F', 'idas', problem)"]
+    end
+    
+    A --> B --> C --> D --> E
+```
+
+---
+
+## 5.2 디버깅 팁
+
+### 표현식 트리 시각화
+
 ```python
 model = pybamm.lithium_ion.DFN()
 sim = pybamm.Simulation(model)
 sim.build()
 
-# 상태 벡터 크기
-print(f"RHS size: {sim._built_model.len_rhs}")
-print(f"Algebraic size: {sim._built_model.len_alg}")
-
-# 변수 슬라이스 확인
-print(sim._disc.y_slices)
+# RHS 표현식 확인
+rhs = sim._built_model.concatenated_rhs
+rhs.visualise("rhs_tree.png")
 ```
 
-### 2. CasADi 함수 확인
+### 상태 벡터 슬라이스 확인
+
 ```python
-sim.solve([0, 3600])
+print(sim._disc.y_slices)
+# {Variable(...): [slice(0, 200)], ...}
+```
+
+### CasADi 함수 확인
+
+```python
+sim.solve([0, 100])
 built_model = sim._built_model
 
-# CasADi RHS 함수
-print(built_model.casadi_rhs)
-
-# CasADi Algebraic 함수
-print(built_model.casadi_algebraic)
-```
-
-### 3. Integrator 확인
-```python
-solver = sim._solver
-# integrator specs 확인
-print(solver.integrator_specs)
+print("RHS function:", built_model.casadi_rhs)
+print("Algebraic function:", built_model.casadi_algebraic)
 ```
 
 ---
 
-## 주요 클래스/함수 참조
+## 5.3 주요 파일 참조
 
-| 위치 | 역할 |
-|-----|-----|
-| [DFN](file:///c:/Users/Ryu/Python_project/data/PyBaMM-develop/src/pybamm/models/full_battery_models/lithium_ion/dfn.py) | 모델 정의 |
-| [Simulation.solve()](file:///c:/Users/Ryu/Python_project/data/PyBaMM-develop/src/pybamm/simulation.py#L434-L612) | 시뮬레이션 실행 진입점 |
-| [Discretisation.process_model()](file:///c:/Users/Ryu/Python_project/data/PyBaMM-develop/src/pybamm/discretisations/discretisation.py#L117-L299) | 모델 이산화 |
-| [BaseSolver.set_up()](file:///c:/Users/Ryu/Python_project/data/PyBaMM-develop/src/pybamm/solvers/base_solver.py#L151-L318) | 솔버 셋업 및 CasADi 변환 |
-| [CasadiConverter](file:///c:/Users/Ryu/Python_project/data/PyBaMM-develop/src/pybamm/expression_tree/operations/convert_to_casadi.py) | 표현식 트리 → CasADi 변환 |
-| [CasadiSolver.create_integrator()](file:///c:/Users/Ryu/Python_project/data/PyBaMM-develop/src/pybamm/solvers/casadi_solver.py#L496-L598) | casadi.integrator() 생성 |
-| [CasadiSolver._run_integrator()](file:///c:/Users/Ryu/Python_project/data/PyBaMM-develop/src/pybamm/solvers/casadi_solver.py#L600-L726) | 적분 실행 |
+| 단계 | 파일 | 핵심 함수/클래스 |
+|------|------|-----------------|
+| 수식 정의 | [full_diffusion.py](file:///c:/Users/Ryu/Python_project/data/PyBaMM-develop/src/pybamm/models/submodels/electrolyte_diffusion/full_diffusion.py) | `set_rhs()` |
+| 수식 정의 | [fickian_diffusion.py](file:///c:/Users/Ryu/Python_project/data/PyBaMM-develop/src/pybamm/models/submodels/particle/fickian_diffusion.py) | `set_rhs()` |
+| 수식 정의 | [butler_volmer.py](file:///c:/Users/Ryu/Python_project/data/PyBaMM-develop/src/pybamm/models/submodels/interface/kinetics/butler_volmer.py) | `_get_kinetics()` |
+| 이산화 | [discretisation.py](file:///c:/Users/Ryu/Python_project/data/PyBaMM-develop/src/pybamm/discretisations/discretisation.py) | `process_model()` |
+| 공간 이산화 | [finite_volume.py](file:///c:/Users/Ryu/Python_project/data/PyBaMM-develop/src/pybamm/spatial_methods/finite_volume.py) | `gradient_matrix()`, `divergence_matrix()` |
+| CasADi 변환 | [convert_to_casadi.py](file:///c:/Users/Ryu/Python_project/data/PyBaMM-develop/src/pybamm/expression_tree/operations/convert_to_casadi.py) | `CasadiConverter._convert()` |
+| Solver Setup | [base_solver.py](file:///c:/Users/Ryu/Python_project/data/PyBaMM-develop/src/pybamm/solvers/base_solver.py#L1674) | `process()` |
+| Integrator | [casadi_solver.py](file:///c:/Users/Ryu/Python_project/data/PyBaMM-develop/src/pybamm/solvers/casadi_solver.py#L496) | `create_integrator()` |
