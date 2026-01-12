@@ -1,0 +1,109 @@
+# This workflow periodically runs the benchmarks suite in benchmarks/
+# using asv and publish the results, effectively updating
+# the display website hosted in the pybamm-bench repo
+
+# Steps:
+# - Benchmark all commits since the last one that was benchmarked
+# - Push results to pybamm-bench repo
+# - Publish website
+name: Benchmarks
+on:
+  # Every day at 3 am UTC
+  schedule:
+    - cron: "0 3 * * *"
+  # Make it possible to trigger the
+  # workflow manually
+  workflow_dispatch:
+
+
+permissions: {}
+
+env:
+  PYBAMM_DISABLE_TELEMETRY: "true"
+
+jobs:
+  benchmarks:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548 # v6.1.0
+        with:
+          python-version: 3.12
+
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install gfortran gcc libopenblas-dev
+
+      - uses: astral-sh/setup-uv@681c641aba71e4a1c380be3ab5e12ad51f415867 # v7.1.6
+        with:
+          version: "latest"
+          enable-cache: true
+
+      - name: Install python dependencies
+        run: uv pip install --system asv
+
+      - name: Run benchmarks
+        run: |
+          asv machine --machine "GitHubRunner"
+          asv run --machine "GitHubRunner" NEW --show-stderr -v
+
+      - name: Upload results as artifact
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: asv_periodic_results
+          path: results
+          if-no-files-found: error
+
+  publish-results:
+    if: github.repository == 'pybamm-team/PyBaMM'
+    name: Push and publish results
+    needs: benchmarks
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Set up Python 3.12
+        uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548 # v6.1.0
+        with:
+          python-version: 3.12
+
+      - name: Install asv
+        run: pip install asv
+
+      - name: Checkout pybamm-bench repo
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        with:
+          repository: pybamm-team/pybamm-bench
+          token: ${{ secrets.BENCH_PAT }}
+          persist-credentials: false
+
+      - name: Download results artifact(s)
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          path: results
+          merge-multiple: true
+
+      - name: Copy new results and push to pybamm-bench repo
+        env:
+          PUSH_BENCH_EMAIL: ${{ secrets.PUSH_BENCH_EMAIL }}
+          PUSH_BENCH_NAME: ${{ secrets.PUSH_BENCH_NAME }}
+        run: |
+          git config --global user.email "$PUSH_BENCH_EMAIL"
+          git config --global user.name "$PUSH_BENCH_NAME"
+          git add results
+          git commit -am "Add new results"
+          git push
+
+      - name: Publish results
+        run: |
+          asv publish
+          git fetch origin gh-pages:gh-pages
+          asv gh-pages

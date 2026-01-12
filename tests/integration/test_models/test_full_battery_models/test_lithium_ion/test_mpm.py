@@ -1,0 +1,166 @@
+#
+# Tests for the lithium-ion MPM model
+#
+import numpy as np
+
+import pybamm
+import tests
+
+
+class TestMPM:
+    def test_basic_processing(self):
+        options = {"thermal": "isothermal"}
+        model = pybamm.lithium_ion.MPM(options)
+        # use Ecker parameters for nonlinear diffusion
+        param = pybamm.ParameterValues("Ecker2015")
+        param = pybamm.get_size_distribution_parameters(param)
+        modeltest = tests.StandardModelTest(model)
+        modeltest.test_all()
+
+    def test_optimisations(self):
+        options = {"thermal": "isothermal"}
+        model = pybamm.lithium_ion.MPM(options)
+        optimtest = tests.OptimisationsTest(model)
+
+        original = optimtest.evaluate_model()
+        to_python = optimtest.evaluate_model(to_python=True)
+        np.testing.assert_allclose(original, to_python, rtol=1e-7, atol=1e-6)
+
+        if pybamm.has_jax():
+            to_jax = optimtest.evaluate_model(to_jax=True)
+            np.testing.assert_allclose(original, to_jax, rtol=1e-7, atol=1e-6)
+
+    def test_set_up(self):
+        model = pybamm.lithium_ion.MPM()
+        optimtest = tests.OptimisationsTest(model)
+        optimtest.set_up_model(to_python=True)
+        optimtest.set_up_model(to_python=False)
+
+    def test_particle_uniform(self):
+        options = {"particle": "uniform profile"}
+        model = pybamm.lithium_ion.MPM(options)
+        modeltest = tests.StandardModelTest(model)
+        modeltest.test_all()
+
+    def test_differential_surface_form(self):
+        options = {"surface form": "differential"}
+        model = pybamm.lithium_ion.MPM(options)
+        modeltest = tests.StandardModelTest(model)
+        modeltest.test_all()
+
+    def test_current_sigmoid_ocp(self):
+        options = {"open-circuit potential": ("current sigmoid", "single")}
+        model = pybamm.lithium_ion.MPM(options)
+        parameter_values = pybamm.ParameterValues("Chen2020")
+        parameter_values = pybamm.get_size_distribution_parameters(parameter_values)
+        parameter_values.update(
+            {
+                "Negative electrode lithiation OCP [V]": parameter_values[
+                    "Negative electrode OCP [V]"
+                ],
+                "Negative electrode delithiation OCP [V]": parameter_values[
+                    "Negative electrode OCP [V]"
+                ],
+            },
+            check_already_exists=False,
+        )
+        modeltest = tests.StandardModelTest(model, parameter_values=parameter_values)
+        modeltest.test_all(skip_output_tests=True)
+
+    def test_one_state_differential_capacity_hysteresis_ocp(self):
+        options = {
+            "open-circuit potential": (
+                "one-state differential capacity hysteresis",
+                "single",
+            )
+        }
+        model = pybamm.lithium_ion.MPM(options)
+        parameter_values = pybamm.ParameterValues("Chen2020")
+        parameter_values = pybamm.get_size_distribution_parameters(parameter_values)
+        parameter_values.update(
+            {
+                "Negative electrode lithiation OCP [V]": lambda sto: parameter_values[
+                    "Negative electrode OCP [V]"
+                ](sto)
+                - 0.1,
+                "Negative electrode delithiation OCP [V]": lambda sto: parameter_values[
+                    "Negative electrode OCP [V]"
+                ](sto)
+                + 0.1,
+                "Negative particle hysteresis decay rate": 1,
+                "Negative particle hysteresis switching factor": 1,
+                "Initial hysteresis state in negative electrode": -0.5,
+            },
+            check_already_exists=False,
+        )
+        modeltest = tests.StandardModelTest(model, parameter_values=parameter_values)
+        modeltest.test_all(skip_output_tests=True)
+
+    def test_one_state_hysteresis_ocp(self):
+        options = {"open-circuit potential": ("one-state hysteresis", "single")}
+        model = pybamm.lithium_ion.MPM(options)
+        parameter_values = pybamm.ParameterValues("Chen2020")
+        parameter_values = pybamm.get_size_distribution_parameters(parameter_values)
+        parameter_values.update(
+            {
+                "Negative electrode lithiation OCP [V]": lambda sto: parameter_values[
+                    "Negative electrode OCP [V]"
+                ](sto)
+                - 0.1,
+                "Negative electrode delithiation OCP [V]": lambda sto: parameter_values[
+                    "Negative electrode OCP [V]"
+                ](sto)
+                + 0.1,
+                "Negative particle lithiation hysteresis decay rate": 10,
+                "Negative particle delithiation hysteresis decay rate": 10,
+                "Initial hysteresis state in negative electrode": 0.0,
+            },
+            check_already_exists=False,
+        )
+        modeltest = tests.StandardModelTest(model, parameter_values=parameter_values)
+        modeltest.test_all(skip_output_tests=True)
+
+    def test_voltage_control(self):
+        options = {"operating mode": "voltage"}
+        model = pybamm.lithium_ion.MPM(options)
+        param = model.default_parameter_values
+        param.update({"Voltage function [V]": 3.8}, check_already_exists=False)
+        modeltest = tests.StandardModelTest(model, parameter_values=param)
+        modeltest.test_all(skip_output_tests=True)
+
+    def test_conservation_each_electrode(self):
+        # Test that surface areas are being calculated from the distribution correctly
+        # for any discretization in the size domain.
+        # We test that the amount of lithium removed or added to each electrode
+        # is the same as for the SPM with the same parameters
+        models = [pybamm.lithium_ion.SPM(), pybamm.lithium_ion.MPM()]
+
+        # reduce number of particle sizes, for a crude discretization
+        var_pts = {"R_n": 3, "R_p": 3}
+
+        t_eval = [0, 3500]
+        t_interp = np.linspace(t_eval[0], t_eval[-1], 100)
+
+        # solve
+        neg_Li = []
+        pos_Li = []
+        for model in models:
+            sim = pybamm.Simulation(model)
+            sim.var_pts.update(var_pts)
+            solution = sim.solve(t_eval, t_interp=t_interp)
+            neg = solution["Total lithium in negative electrode [mol]"].entries[-1]
+            pos = solution["Total lithium in positive electrode [mol]"].entries[-1]
+            neg_Li.append(neg)
+            pos_Li.append(pos)
+
+        # compare
+        np.testing.assert_allclose(neg_Li[0], neg_Li[1], rtol=1e-13, atol=1e-13)
+        np.testing.assert_allclose(pos_Li[0], pos_Li[1], rtol=1e-13, atol=1e-13)
+
+    def test_basic_processing_nonlinear_diffusion(self):
+        model = pybamm.lithium_ion.MPM()
+        # Ecker2015 has a nonlinear diffusion coefficient
+        parameter_values = pybamm.ParameterValues("Ecker2015")
+        parameter_values = pybamm.get_size_distribution_parameters(parameter_values)
+        modeltest = tests.StandardModelTest(model, parameter_values=parameter_values)
+        modeltest.test_all(skip_output_tests=True)
