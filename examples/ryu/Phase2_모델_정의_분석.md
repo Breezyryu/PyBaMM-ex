@@ -1491,6 +1491,302 @@ flowchart LR
 
 ---
 
+## 11. Mathematical Mapping (수학적 매핑)
+
+### 11.1 model.rhs 딕셔너리 상세 매핑
+
+`model.rhs`는 시간 미분 방정식 (ODE) $\frac{\partial y}{\partial t} = f(y, t)$를 정의합니다:
+
+| Variable 키 | PyBaMM 표현식 | 수학 수식 | 물리적 의미 |
+|:-----------|:-------------|:---------|:-----------|
+| `c_s_n` | `div(D_s_n * grad(c_s_n)) / r^2` | $\frac{1}{r^2}\frac{\partial}{\partial r}\left(r^2 D_s \frac{\partial c_s}{\partial r}\right)$ | 음극 입자 확산 |
+| `c_s_p` | `div(D_s_p * grad(c_s_p)) / r^2` | $\frac{1}{r^2}\frac{\partial}{\partial r}\left(r^2 D_s \frac{\partial c_s}{\partial r}\right)$ | 양극 입자 확산 |
+| `eps_c_e` | `div(D_e_eff * grad(c_e)) + source` | $\nabla \cdot (D_e^{eff} \nabla c_e) + \frac{(1-t^+)}{F}aj$ | 전해질 농도 $(ε \cdot c_e)$ |
+| `T_av` | `Q_total / (rho * c_p)` | $\rho c_p \frac{\partial T}{\partial t} = Q_{total}$ | 온도 (lumped) |
+| `L_sei` | `V_bar_sei * j_sei / (a * F)` | $\frac{\partial L_{sei}}{\partial t} = \frac{\bar{V}_{sei} j_{sei}}{aF}$ | SEI 두께 |
+
+### 11.2 model.algebraic 딕셔너리 상세 매핑
+
+`model.algebraic`은 대수 방정식 $0 = g(y, t)$를 정의합니다:
+
+| Variable 키 | PyBaMM 표현식 | 수학 수식 | 물리적 의미 |
+|:-----------|:-------------|:---------|:-----------|
+| `phi_s_n` | `div(sigma_n * grad(phi_s_n)) - a_n * j_n` | $\nabla \cdot (\sigma^{eff}_n \nabla \phi_{s,n}) = a_n j_n$ | 음극 고체 전위 |
+| `phi_s_p` | `div(sigma_p * grad(phi_s_p)) - a_p * j_p` | $\nabla \cdot (\sigma^{eff}_p \nabla \phi_{s,p}) = a_p j_p$ | 양극 고체 전위 |
+| `phi_e` | `div(kappa_eff * grad(phi_e)) + div(kappa_D * grad(ln(c_e))) + source` | $\nabla \cdot (\kappa^{eff} \nabla \phi_e) + \nabla \cdot (\kappa_D^{eff} \nabla \ln c_e) = -aj$ | 전해질 전위 |
+| `j_n` | `j - j_0 * (exp(...) - exp(...))` | $j = j_0 \left[\exp\left(\frac{\alpha_aF\eta}{RT}\right) - \exp\left(-\frac{\alpha_cF\eta}{RT}\right)\right]$ | 음극 반응 전류 |
+
+### 11.3 model.boundary_conditions 상세
+
+```python
+model.boundary_conditions = {
+    c_s_n: {
+        "left": (pybamm.Scalar(0), "Neumann"),   # r=0: 대칭 조건
+        "right": (-j_n / (F * D_s_n), "Neumann"), # r=R: 플럭스 = j/F
+    },
+    c_e: {
+        "left": (pybamm.Scalar(0), "Neumann"),   # x=0: 무플럭스
+        "right": (pybamm.Scalar(0), "Neumann"),  # x=L: 무플럭스
+    },
+    phi_s_n: {
+        "left": (pybamm.Scalar(0), "Dirichlet"), # x=0: 기준 전위
+        "right": (pybamm.Scalar(0), "Neumann"),  # 분리막 경계: 무전류
+    },
+}
+```
+
+| 변수 | 왼쪽 경계 (x=0 또는 r=0) | 오른쪽 경계 (x=L 또는 r=R) |
+|:----|:----------------------|:------------------------|
+| $c_s$ | $\frac{\partial c_s}{\partial r} = 0$ (대칭) | $-D_s\frac{\partial c_s}{\partial r} = \frac{j}{F}$ (플럭스) |
+| $c_e$ | $\frac{\partial c_e}{\partial x} = 0$ (무플럭스) | $\frac{\partial c_e}{\partial x} = 0$ (무플럭스) |
+| $\phi_{s,n}$ | $\phi_s = 0$ (기준) | $\frac{\partial \phi_s}{\partial x} = 0$ (절연) |
+| $\phi_{s,p}$ | $\frac{\partial \phi_s}{\partial x} = 0$ (절연) | $-\sigma \frac{\partial \phi_s}{\partial x} = \frac{I}{A}$ (전류) |
+
+---
+
+## 12. Core Methods & Logic (핵심 메서드 로직)
+
+### 12.1 서브모델 메서드 호출 순서
+
+```mermaid
+sequenceDiagram
+    participant Model as BaseModel
+    participant Sub as Submodel
+    participant Vars as variables 딕셔너리
+    
+    Model->>Sub: get_fundamental_variables()
+    Sub-->>Vars: {c_s, c_e, ...} 추가
+    
+    Model->>Sub: get_coupled_variables(variables)
+    Sub-->>Vars: {j, eta, ...} 추가
+    
+    Model->>Sub: set_rhs(variables)
+    Sub-->>Model: model.rhs[c_s] = ...
+    
+    Model->>Sub: set_algebraic(variables)
+    Sub-->>Model: model.algebraic[phi_s] = ...
+    
+    Model->>Sub: set_boundary_conditions(variables)
+    Sub-->>Model: model.boundary_conditions[c_s] = ...
+    
+    Model->>Sub: set_initial_conditions(variables)
+    Sub-->>Model: model.initial_conditions[c_s] = c_s_0
+```
+
+### 12.2 set_rhs() 메서드 내부 동작
+
+```python
+# FickianDiffusion 서브모델의 set_rhs() 예시
+def set_rhs(self, variables):
+    c_s = variables[f"{self.domain} particle concentration"]
+    N_s = variables[f"{self.domain} particle rhs"]
+    
+    # 구형 좌표계 확산 방정식
+    # ∂c_s/∂t = (1/r²) ∂/∂r (r² D_s ∂c_s/∂r)
+    self.rhs = {c_s: pybamm.div(N_s)}
+```
+
+### 12.3 set_algebraic() 메서드 예시
+
+```python
+# Butler-Volmer 동역학의 set_algebraic() 예시
+def set_algebraic(self, variables):
+    j = variables[f"{self.domain} interfacial current density"]
+    j_0 = variables[f"{self.domain} exchange current density"]
+    eta = variables[f"{self.domain} overpotential"]
+    
+    # Butler-Volmer: j = j_0 * [exp(α_a F η / RT) - exp(-α_c F η / RT)]
+    F = self.param.F
+    RT = self.param.R * T
+    
+    j_calc = j_0 * (pybamm.exp(alpha_a * F * eta / RT) 
+                   - pybamm.exp(-alpha_c * F * eta / RT))
+    
+    self.algebraic = {j: j - j_calc}
+```
+
+### 12.4 변수 Coupling 의존성
+
+```mermaid
+flowchart TD
+    subgraph "기본 변수 (Fundamental)"
+        c_s["c_s (입자 농도)"]
+        c_e["c_e (전해질 농도)"]
+        T["T (온도)"]
+        phi_s["φ_s (고체 전위)"]
+        phi_e["φ_e (전해질 전위)"]
+    end
+    
+    subgraph "결합 변수 (Coupled)"
+        c_surf["c_s,surf = c_s|_{r=R}"]
+        stoich["x = c_s,surf / c_s,max"]
+        U_ocp["U_ocp(x, T)"]
+        j_0["j_0 = f(c_e, c_surf, T)"]
+        eta["η = φ_s - φ_e - U_ocp"]
+        j["j = j_0 * sinh(F*η / 2RT)"]
+    end
+    
+    subgraph "방정식 (RHS/Algebraic)"
+        rhs_cs["∂c_s/∂t = div(D*grad(c_s))"]
+        rhs_ce["∂(εc_e)/∂t = div(D_e*grad(c_e)) + aj"]
+        alg_phis["div(σ*grad(φ_s)) = aj"]
+        alg_phie["div(κ*grad(φ_e)) = -aj"]
+    end
+    
+    c_s --> c_surf --> stoich --> U_ocp
+    c_e --> j_0
+    c_surf --> j_0
+    T --> j_0
+    T --> U_ocp
+    
+    phi_s --> eta
+    phi_e --> eta
+    U_ocp --> eta
+    
+    j_0 --> j
+    eta --> j
+    
+    j --> rhs_cs
+    j --> rhs_ce
+    j --> alg_phis
+    j --> alg_phie
+```
+
+---
+
+## 13. PyBaMM Architecture Context (아키텍처 컨텍스트)
+
+### 13.1 전체 파이프라인에서 Model Definition의 위치
+
+```mermaid
+flowchart TD
+    subgraph "1. Model Definition 【현재 분석 범위】"
+        M1["BaseModel / BaseBatteryModel"]
+        M2["DFN / SPM / SPMe"]
+        M3["Submodels (Particle, Kinetics, ...)"]
+        M4["model.rhs, model.algebraic"]
+        M5["BatteryModelOptions"]
+    end
+    
+    subgraph "2. Simulation"
+        S1["Simulation.__init__(model)"]
+        S2["build()"]
+    end
+    
+    subgraph "3. Parameter Processing"
+        P1["ParameterValues"]
+        P2["Parameter → Scalar"]
+    end
+    
+    subgraph "4. Discretisation"
+        D1["Mesh 생성"]
+        D2["Variable → StateVector"]
+        D3["Operator → Matrix"]
+    end
+    
+    subgraph "5. Solver"
+        V1["to_casadi()"]
+        V2["CasadiSolver / IDAKLUSolver"]
+    end
+    
+    M1 --> M2 --> M3 --> M4
+    M5 --> M2
+    M4 --> S1 --> S2
+    S2 --> P1 --> P2
+    P2 --> D1 --> D2 --> D3
+    D3 --> V1 --> V2
+```
+
+### 13.2 Model Definition이 담당하는 역할
+
+| 역할 | 관련 클래스/메서드 | 설명 |
+|:----|:----------------|:-----|
+| **방정식 정의** | `BaseModel.rhs`, `algebraic` | DAE 시스템의 심볼릭 표현 |
+| **서브모델 조합** | `DFN.set_submodels()` | 물리 현상별 모듈 조합 |
+| **옵션 관리** | `BatteryModelOptions` | 모델 설정 조합 검증 |
+| **변수 관리** | `model.variables` | FuzzyDict로 변수 이름 접근 |
+| **기본값 제공** | `default_geometry`, `default_solver` | Simulation에서 사용할 기본값 |
+
+### 13.3 모델 빌드 프로세스 상세
+
+```mermaid
+flowchart TD
+    subgraph "1. 모델 초기화"
+        A1["DFN(options, build=True)"]
+        A2["options 검증 (BatteryModelOptions)"]
+        A3["set_submodels() 호출"]
+    end
+    
+    subgraph "2. 서브모델 등록"
+        B1["set_particle_submodel()"]
+        B2["set_electrolyte_submodel()"]
+        B3["set_interface_submodel()"]
+        B4["set_thermal_submodel()"]
+    end
+    
+    subgraph "3. 변수 수집"
+        C1["build_fundamental_variables()"]
+        C2["for sub: sub.get_fundamental_variables()"]
+    end
+    
+    subgraph "4. 변수 결합"
+        D1["build_coupled_variables()"]
+        D2["for sub: sub.get_coupled_variables()"]
+        D3["의존성 해결 루프"]
+    end
+    
+    subgraph "5. 방정식 설정"
+        E1["build_model_equations()"]
+        E2["for sub: sub.set_rhs()"]
+        E3["for sub: sub.set_algebraic()"]
+        E4["for sub: sub.set_boundary_conditions()"]
+        E5["for sub: sub.set_initial_conditions()"]
+    end
+    
+    A1 --> A2 --> A3
+    A3 --> B1 --> B2 --> B3 --> B4
+    B4 --> C1 --> C2
+    C2 --> D1 --> D2 --> D3
+    D3 --> E1 --> E2 --> E3 --> E4 --> E5
+```
+
+### 13.4 서브모델 카테고리별 역할
+
+```mermaid
+mindmap
+  root((Model))
+    Mass Conservation
+      Particle
+        c_s RHS
+        입자 확산
+      Electrolyte
+        c_e RHS
+        Stefan-Maxwell
+    Charge Conservation
+      Electrode
+        φ_s Algebraic
+        Ohm's Law
+      Electrolyte Potential
+        φ_e Algebraic
+        이온 전도
+    Interface
+      Kinetics
+        j Algebraic
+        Butler-Volmer
+      SEI
+        L_sei RHS
+        성장 모델
+    Thermal
+      Temperature
+        T RHS
+        열 균형
+    External Circuit
+      Voltage/Current
+        제어 모드
+```
+
+---
+
 ## 파일 참조
 
 | 파일 | 라인 수 | 핵심 내용 |
